@@ -1,72 +1,103 @@
 import pandas as pd
-import logging
-from datetime import datetime
+import datetime
+import json
+import asyncio
+from typing import Dict, List, Optional
+from pydantic import BaseModel, Field
 
-class EligibilityInquiryEngine:
-    def __init__(self, reference_file='status_descriptors.csv'):
-        """
-        Dynamically loads ALL descriptors from your uploaded GitHub CSV.
-        """
-        try:
-            df = pd.read_csv(reference_file)
-            # Create lookup dictionaries from your spreadsheet
-            self.inq_map = dict(zip(df['Inquiry Status Code'].astype(str), df['Inquiry Details']))
-            self.elig_map = dict(zip(df['Status Code'].astype(str), df['Status Description']))
-            self.svc_map = dict(zip(df['Service Type Code'].astype(str), df['Service Type Description']))
-            logging.info("Reference tables loaded successfully.")
-        except Exception as e:
-            logging.error(f"Mapping failed: Ensure {reference_file} is in the repo. {e}")
+# --- MASTER LOOKUP SCHEMA (Based on status_descriptors.csv) ---
+class EligibilityLookups:
+    def __init__(self, descriptor_path: str):
+        # Load the proprietary status maps from your provided CSV 
+        df = pd.read_csv(descriptor_path)
+        self.reject_map = df.set_index('Inquiry Status Code').to_dict()
+        self.status_map = df.set_index('Status Code').to_dict()
+        self.service_map = df.set_index('Service Type Code').to_dict()
 
-    def parse_raw_271(self, edi_content):
+# --- REALTIME ELIGIBILITY BRIDGE ENGINE ---
+class RealtimeEligibilityBridge:
+    def __init__(self, lookups: EligibilityLookups):
+        self.maps = lookups
+        self.isa_control_num = 1
+        self.seg_sep = "*"
+        self.term = "~"
+
+    # --- PILLAR 1: 270 REQUEST GENERATOR (ISA-IEA Envelope) ---
+    def generate_270_request(self, inquiry_data: Dict) -> str:
         """
-        High-fidelity parser for ANSI X12 271 segments.
+        Transforms Master ETL data into a valid ANSI X12 270 Inquiry.
+        Adheres to Loop 2000A/B/C requirements from your 271 Segment Table.
         """
-        # Healthcare EDI segments are typically separated by '~' and elements by '*'
-        segments = [seg.split('*') for seg in edi_content.split('~')]
-        extraction_list = []
+        now = datetime.datetime.now()
+        date_str = now.strftime("%Y%m%d")
+        time_str = now.strftime("%H%M")
         
-        # Temporary variables to hold loop data
-        patient_data = {"L_Name": "", "F_Name": "", "AAA01": "Y", "AAA03": "", "EB01": "", "EB07": "0.00", "EQ01": ""}
+        # Build hierarchical segments 
+        segments =}*{time_str}*|*00501*{self.isa_control_num:09}*0*P*:~",
+            f"GS*HS*SENDER*CMS*{date_str}*{time_str}*1*X*005010X279A1~",
+            f"ST*270*0001*005010X279A1~",
+            f"BHT*0022*13*REF{self.isa_control_num:09}*{date_str}*{time_str}~",
+            # Loop 2100C - Subscriber Info 
+            f"NM1*IL*1*{inquiry_data['LName']}*{inquiry_data['FName']}****MI*{inquiry_data}~",
+            f"DMG*D8*{inquiry_data}~",
+            f"EQ*{inquiry_data}~",
+            f"SE*7*0001~",
+            f"GE*1*1~",
+            f"IEA*1*{self.isa_control_num:09}~"
+        ]
+        self.isa_control_num += 1
+        return "".join(segments)
+
+    # --- PILLAR 2: 271 RESPONSE DECODER (Status Mapping Logic) ---
+    def parse_271_response(self, edi_content: str) -> Dict:
+        """
+        Decodes raw 271 segments into the 'Inquiry Data Extraction' format.
+        Uses AAA01, AAA03, and EB01 logic from your Eligibility Mapping.
+        """
+        segments = edi_content.split("~")
+        result = {
+            "271 Status": "Verified",
+            "271 Details": "Active Coverage Found",
+            "Eligibility Status": "N/A",
+            "Patient Responsibility": 0.00,
+            "Service Type": "N/A"
+        }
 
         for seg in segments:
-            tag = seg[0]
-            
-            # NM1 Segment: Patient/Subscriber Name
-            if tag == 'NM1' and seg[1] == 'IL':
-                patient_data["L_Name"] = seg[3]
-                patient_data["F_Name"] = seg[4] if len(seg) > 4 else ""
+            elements = seg.split("*")
+            tag = elements
 
-            # AAA Segment: Reject Reason (Situational)
-            elif tag == 'AAA':
-                patient_data["AAA01"] = seg[1] # Valid Request Indicator (Y/N)
-                patient_data["AAA03"] = seg[3] # Reject Reason Code
+            # 1. Subscriber Name Logic
+            if tag == "NM1" and "IL" in elements:
+                result["Patient Last Name"] = elements
+                result["Patient First Name"] = elements[2]
 
-            # EB Segment: Eligibility/Benefit (Required)
-            elif tag == 'EB':
-                patient_data["EB01"] = seg[1] # Status Code (1, 6, I, etc.)
-                patient_data["EB03"] = seg[3] # Service Type Code
-                patient_data["EB07"] = seg[7] if len(seg) > 7 else "0.00" # Benefit Amount
+            # 2. Reject Code Logic (AAA Segment) 
+            elif tag == "AAA":
+                result = "Not Verified - See 271 Details"
+                reject_code = elements
+                result = self.maps.reject_map.get(int(reject_code), f"Reject Code {reject_code}")
 
-            # SE Segment: End of Transaction
-            elif tag == 'SE':
-                # Map extracted codes to descriptions using the CSV lookup
-                row = {
-                    "Patient Last Name": patient_data["L_Name"],
-                    "Patient First Name": patient_data["F_Name"],
-                    "Inquiry Date": datetime.now().strftime("%m/%d/%Y"),
-                    "271 Status": "Verified" if patient_data["AAA01"] == 'Y' else "Not Verified",
-                    "271 Details": self.inq_map.get(str(patient_data["AAA03"]), "Validated"),
-                    "Eligibility Status": self.elig_map.get(str(patient_data["EB01"]), "See Raw 271"),
-                    "Patient Responsibility": patient_data["EB07"],
-                    "Service Type": self.svc_map.get(str(patient_data["EB03"]), "General")
-                }
-                extraction_list.append(row)
-        
-        return pd.DataFrame(extraction_list)
+            # 3. Eligibility & Service Type Logic (EB Segment) 
+            elif tag == "EB":
+                status_code = elements[3]
+                result = self.maps.status_map.get(status_code, status_code)
+                
+                # Capture Patient Responsibility from EB07 
+                if len(elements) > 7 and elements[4]:
+                    result = float(elements[4])
+                
+                # Map Service Type from EB03 
+                service_code = elements
+                result = self.maps.service_map.get(service_code, service_code)
 
-# --- DEMONSTRATION ---
-# This EDI string mimics the '271 Elig Resp Example.pdf'
-raw_edi = "ISA*00*...~NM1*IL*1*SMITH*JOHN~AAA*N**75~EB*6**30~SE*10*0001~"
-engine = EligibilityInquiryEngine()
-final_report = engine.parse_raw_271(raw_edi)
-print(final_report.to_string())
+        return result
+
+    # --- PILLAR 3: STANDARDIZED EXPORT (Inquiry Export File) ---
+    def export_to_standard_csv(self, parsed_results: List, filename="Inquiry_Export.csv"):
+        """Generates the exact CSV payload required for enterprise reporting.[1]"""
+        df = pd.DataFrame(parsed_results)
+        # Reorder to match your 'Inquiry Data Extraction' headers 
+        headers =
+        df[headers].to_csv(filename, index=False)
+        print(f"[+] Final Inquiry Export generated: {filename}")

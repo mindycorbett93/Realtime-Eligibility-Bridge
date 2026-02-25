@@ -1,4 +1,0 @@
-Patient Last Name,Patient First Name,Inquiry Date,271 Status,271 Details,Eligibility Status,Patient Responsibility,Service Type
-SMITH,JOHN,01/16/2026,Verified,Validated,Active,25,Health Benefit Plan Coverage
-DOE,JANE,01/16/2026,Not Verified,Subscriber/Insured Not Found,Inactive,0,Professional Visit - Office
-MASON,JUSTIN,01/16/2026,Not Verified,Unable to Respond at this time,Unknown,0,Medical Care
